@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>囤粮大作战 · Lucky's Hoard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    height: 100%;
+    background: #1a1611;
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    overflow: hidden;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  #wrap {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    background: #2d4a2b;
+    border-radius: 16px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.5);
+    touch-action: none;
+    max-width: 96vw;
+    max-height: 92vh;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game"></canvas></div>
+<script>
+(() => {
+  // ================= 基础设定 =================
+  const W = 960, H = 600;
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const DPR = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  canvas.style.width = '';
+  ctx.scale(DPR, DPR);
+
+  const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const rand = (a, b) => a + Math.random() * (b - a);
+  const TAU = Math.PI * 2;
+
+  // ================= 游戏状态 =================
+  const NEST = { x: W / 2, y: H - 72, r: 46 };
+  const POUCH_BASE = 5;          // 初始腮帮容量
+  const SEED_TARGET = 8;         // 场上保持的种子数量
+  const CAT_BASE_INTERVAL = 9;   // 猫出现的基础间隔（秒）
+  const DAY_LEN = 30;            // 一天的秒数
+
+  let state = 'title';           // title | playing | over
+  let t = 0, lastTs = 0;
+  let score = 0, best = +(localStorage.getItem('hamsterHoardBest') || 0);
+  let carried = 0, capacity = POUCH_BASE;
+  let day = 1, dayTimer = DAY_LEN;
+  let catTimer = 5;
+  let depositFlash = 0, stealFlash = 0, shake = 0;
+  let msg = '', msgTimer = 0;
+
+  const player = { x: W / 2, y: H - 160, r: 20, vx: 0, vy: 0, face: 1, anim: 0 };
+  let seeds = [];      // {x,y,r,vx,vy,loose}  loose=true 表示猫撞落的散落种子
+  let cats = [];       // {x,y,r,vx,vy,wander}
+  let particles = [];
+  let grass = [];
+  for (let i = 0; i < 90; i++) grass.push({ x: rand(10, W - 10), y: rand(10, H - 10), s: rand(2, 4), a: rand(0, TAU) });
+
+  // ================= 输入 =================
+  const keys = {};
+  const pointer = { active: false, x: 0, y: 0 };
+  addEventListener('keydown', e => {
+    keys[e.key.toLowerCase()] = true;
+    if (['arrowup','arrowdown','arrowleft','arrowright',' '].includes(e.key.toLowerCase())) e.preventDefault();
+    if (state !== 'playing' && (e.key === ' ' || e.key === 'Enter')) startGame();
+  });
+  addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+
+  function pointerPos(e) {
+    const rect = canvas.getBoundingClientRect();
+    const cx = (e.touches ? e.touches[0].clientX : e.clientX) - rect.left;
+    const cy = (e.touches ? e.touches[0].clientY : e.clientY) - rect.top;
+    return { x: cx / rect.width * W, y: cy / rect.height * H };
+  }
+  const pDown = e => {
+    const p = pointerPos(e);
+    if (state !== 'playing') { startGame(); return; }
+    pointer.active = true; pointer.x = p.x; pointer.y = p.y;
+  };
+  const pMove = e => {
+    if (!pointer.active) return;
+    const p = pointerPos(e);
+    pointer.x = p.x; pointer.y = p.y;
+    e.preventDefault();
+  };
+  const pUp = () => pointer.active = false;
+  canvas.addEventListener('mousedown', pDown);
+  canvas.addEventListener('mousemove', pMove);
+  addEventListener('mouseup', pUp);
+  canvas.addEventListener('touchstart', pDown, { passive: true });
+  canvas.addEventListener('touchmove', pMove, { passive: false });
+  canvas.addEventListener('touchend', pUp);
+
+  // ================= 流程 =================
+  function startGame() {
+    state = 'playing';
+    t = 0; score = 0; carried = 0; capacity = POUCH_BASE;
+    day = 1; dayTimer = DAY_LEN; catTimer = 5;
+    seeds = []; cats = []; particles = [];
+    player.x = W / 2; player.y = H - 160; player.vx = player.vy = 0;
+    msg = '第 1 天'; msgTimer = 2;
+    for (let i = 0; i < SEED_TARGET; i++) spawnSeed();
+  }
+
+  function gameOver() {
+    state = 'over';
+    if (score > best) { best = score; localStorage.setItem('hamsterHoardBest', best); }
+  }
+
+  function spawnSeed() {
+    let x, y, tries = 0;
+    do {
+      x = rand(30, W - 30); y = rand(30, H - 60);
+      tries++;
+    } while (dist({ x, y }, NEST) < NEST.r + 40 && tries < 20);
+    seeds.push({ x, y, r: 8, vx: 0, vy: 0, loose: false, bob: rand(0, TAU) });
+  }
+
+  function spawnCat() {
+    const side = Math.floor(rand(0, 4));
+    let x, y;
+    if (side === 0) { x = -30; y = rand(0, H * 0.7); }
+    else if (side === 1) { x = W + 30; y = rand(0, H * 0.7); }
+    else if (side === 2) { x = rand(0, W); y = -30; }
+    else { x = rand(0, W); y = -30; }
+    const speed = 60 + day * 8 + rand(0, 20);
+    cats.push({ x, y, r: 26, speed, wander: rand(0, TAU), life: 14 + day });
+  }
+
+  function burst(x, y, color, n = 10) {
+    for (let i = 0; i < n; i++) {
+      const a = rand(0, TAU), s = rand(40, 160);
+      particles.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: rand(0.3, 0.7), color });
+    }
+  }
+
+  // ================= 更新 =================
+  function update(dt) {
+    t += dt;
+    dayTimer -= dt;
+    if (dayTimer <= 0) {
+      day++; dayTimer = DAY_LEN;
+      capacity += 1;
+      msg = `第 ${day} 天 · 腮帮容量 +1`; msgTimer = 2.2;
+      burst(player.x, player.y, '#ffd76b', 14);
+    }
+
+    // --- 玩家移动（负重惩罚：装得越满越慢） ---
+    const loadRatio = carried / capacity;
+    const speed = 210 * (1 - 0.55 * loadRatio);
+    let ix = 0, iy = 0;
+    if (keys['arrowleft'] || keys['a']) ix -= 1;
+    if (keys['arrowright'] || keys['d']) ix += 1;
+    if (keys['arrowup'] || keys['w']) iy -= 1;
+    if (keys['arrowdown'] || keys['s']) iy += 1;
+    if (pointer.active) {
+      const dx = pointer.x - player.x, dy = pointer.y - player.y;
+      const d = Math.hypot(dx, dy);
+      if (d > 6) { ix = dx / d; iy = dy / d; }
+    }
+    const il = Math.hypot(ix, iy) || 1;
+    player.vx = (ix / il) * speed;
+    player.vy = (iy / il) * speed;
+    player.x = clamp(player.x + player.vx * dt, player.r, W - player.r);
+    player.y = clamp(player.y + player.vy * dt, player.r, H - player.r);
+    if (ix !== 0) player.face = ix > 0 ? 1 : -1;
+    player.anim = (Math.abs(player.vx) + Math.abs(player.vy)) > 1 ? player.anim + dt * 10 : 0;
+
+    // --- 捡种子 ---
+    for (let i = seeds.length - 1; i >= 0; i--) {
+      const s = seeds[i];
+      // 散落种子缓慢停下（预留物理感）
+      if (dist(player, s) < player.r + s.r) {
+        if (carried < capacity) {
+          carried++;
+          seeds.splice(i, 1);
+          burst(s.x, s.y, '#ffcf5c', 6);
+        }
+      }
+    }
+    const looseCount = seeds.filter(s => s.loose).length;
+    while (seeds.length - looseCount < SEED_TARGET) spawnSeed();
+
+    // --- 回窝存粮 ---
+    if (dist(player, NEST) < NEST.r && carried > 0) {
+      score += carried;
+      burst(NEST.x, NEST.y, '#ffe9a8', 8 + carried * 2);
+      msg = `存入 ${carried} 颗！`; msgTimer = 1.4;
+      depositFlash = 0.35;
+      carried = 0;
+    }
+
+    // --- 猫 ---
+    catTimer -= dt;
+    if (catTimer <= 0) {
+      spawnCat();
+      catTimer = Math.max(3.5, CAT_BASE_INTERVAL - day * 0.6) * rand(0.8, 1.2);
+    }
+    for (let i = cats.length - 1; i >= 0; i--) {
+      const c = cats[i];
+      c.wander += dt * 2;
+      const dx = player.x - c.x, dy = player.y - c.y;
+      const d = Math.hypot(dx, dy) || 1;
+      // 追玩家 + 一点蛇皮走位
+      const wob = Math.sin(c.wander) * 0.5;
+      const ang = Math.atan2(dy, dx) + wob;
+      c.x += Math.cos(ang) * c.speed * dt;
+      c.y += Math.sin(ang) * c.speed * dt;
+      c.life -= dt;
+      if (c.life <= 0 || c.x < -60 || c.x > W + 60 || c.y < -60 || c.y > H + 60) {
+        cats.splice(i, 1);
+        continue;
+      }
+      // 被抓：掉一半身上瓜子，散落一地
+      if (dist(c, player) < c.r + player.r - 4) {
+        if (carried > 0) {
+          const lost = Math.ceil(carried / 2);
+          carried -= lost;
+          for (let k = 0; k < lost; k++) {
+            const a = rand(0, TAU), rr = rand(30, 90);
+            seeds.push({
+              x: clamp(player.x + Math.cos(a) * rr, 20, W - 20),
+              y: clamp(player.y + Math.sin(a) * rr, 20, H - 20),
+              r: 8, loose: true, bob: rand(0, TAU)
+            });
+          }
+          msg = `被猫抓了！掉了 ${lost} 颗`; msgTimer = 1.8;
+        } else {
+          msg = '猫扑了个空'; msgTimer = 1.2;
+        }
+        stealFlash = 0.4; shake = 0.35;
+        burst(player.x, player.y, '#ff8a7a', 16);
+        cats.splice(i, 1);
+      }
+    }
+
+    // --- 粒子 ---
+    for (let i = particles.length - 1; i >= 0; i--) {
+      const p = particles[i];
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      p.vx *= 0.92; p.vy *= 0.92;
+      p.life -= dt;
+      if (p.life <= 0) particles.splice(i, 1);
+    }
+
+    depositFlash = Math.max(0, depositFlash - dt);
+    stealFlash = Math.max(0, stealFlash - dt);
+    shake = Math.max(0, shake - dt);
+    msgTimer = Math.max(0, msgTimer - dt);
+
+    // 三天后结束结算（一局约 90 秒，节奏紧凑）
+    if (day > 3) gameOver();
+  }
+
+  // ================= 绘制 =================
+  function drawHamster(x, y, r, face, anim) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(face, 1);
+    const hop = Math.abs(Math.sin(anim)) * 3;
+    ctx.translate(0, -hop);
+    // 身体
+    ctx.fillStyle = '#e8b06e';
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, TAU); ctx.fill();
+    // 肚皮
+    ctx.fillStyle = '#f7ddb5';
+    ctx.beginPath(); ctx.arc(2, 5, r * 0.62, 0, TAU); ctx.fill();
+    // 耳朵
+    ctx.fillStyle = '#e8b06e';
+    ctx.beginPath(); ctx.arc(-r * 0.55, -r * 0.75, r * 0.32, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(r * 0.55, -r * 0.75, r * 0.32, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#f2c79b';
+    ctx.beginPath(); ctx.arc(-r * 0.55, -r * 0.75, r * 0.17, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(r * 0.55, -r * 0.75, r * 0.17, 0, TAU); ctx.fill();
+    // 腮帮（装了瓜子会鼓起来）
+    if (carried > 0) {
+      const puff = Math.min(1, carried / capacity);
+      ctx.fillStyle = '#f2c79b';
+      ctx.beginPath(); ctx.arc(r * 0.85, r * 0.15, r * (0.2 + 0.28 * puff), 0, TAU); ctx.fill();
+    }
+    // 眼睛
+    ctx.fillStyle = '#33241a';
+    ctx.beginPath(); ctx.arc(r * 0.35, -r * 0.2, 2.6, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(-r * 0.15, -r * 0.2, 2.2, 0, TAU); ctx.fill();
+    // 鼻子
+    ctx.fillStyle = '#d97a6c';
+    ctx.beginPath(); ctx.arc(r * 0.45, r * 0.05, 2.4, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawCat(c) {
+    ctx.save();
+    ctx.translate(c.x, c.y);
+    ctx.fillStyle = '#4a4a52';
+    ctx.beginPath(); ctx.arc(0, 0, c.r, 0, TAU); ctx.fill();
+    // 耳朵
+    ctx.beginPath();
+    ctx.moveTo(-c.r * 0.7, -c.r * 0.5);
+    ctx.lineTo(-c.r * 0.9, -c.r * 1.15);
+    ctx.lineTo(-c.r * 0.25, -c.r * 0.85);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(c.r * 0.7, -c.r * 0.5);
+    ctx.lineTo(c.r * 0.9, -c.r * 1.15);
+    ctx.lineTo(c.r * 0.25, -c.r * 0.85);
+    ctx.closePath(); ctx.fill();
+    // 眼睛
+    ctx.fillStyle = '#ffd34d';
+    ctx.beginPath(); ctx.arc(-c.r * 0.3, -c.r * 0.1, 4, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(c.r * 0.3, -c.r * 0.1, 4, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#1c1c22';
+    ctx.beginPath(); ctx.arc(-c.r * 0.3, -c.r * 0.1, 1.8, 0, TAU); ctx.fill();
+    ctx.beginPath(); ctx.arc(c.r * 0.3, -c.r * 0.1, 1.8, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  function draw() {
+    ctx.save();
+    if (shake > 0) ctx.translate(rand(-6, 6) * shake * 3, rand(-6, 6) * shake * 3);
+
+    // 草地
+    ctx.fillStyle = '#2d4a2b';
+    ctx.fillRect(-20, -20, W + 40, H + 40);
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 2;
+    for (const g of grass) {
+      ctx.beginPath();
+      ctx.moveTo(g.x, g.y);
+      ctx.quadraticCurveTo(g.x + Math.sin(g.a + t) * 3, g.y - g.s * 2, g.x + Math.sin(g.a) * 2, g.y - g.s * 3);
+      ctx.stroke();
+    }
+
+    // 窝
+    const glow = 0.5 + Math.sin(t * 2) * 0.12 + depositFlash * 1.6;
+    const grad = ctx.createRadialGradient(NEST.x, NEST.y, 4, NEST.x, NEST.y, NEST.r * 1.8);
+    grad.addColorStop(0, `rgba(255, 214, 120, ${0.28 * glow})`);
+    grad.addColorStop(1, 'rgba(255, 214, 120, 0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath(); ctx.arc(NEST.x, NEST.y, NEST.r * 1.8, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#6b4f35';
+    ctx.beginPath(); ctx.arc(NEST.x, NEST.y, NEST.r, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#8a6a48';
+    ctx.beginPath(); ctx.arc(NEST.x, NEST.y, NEST.r * 0.7, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#3e2f22';
+    ctx.beginPath(); ctx.arc(NEST.x, NEST.y, NEST.r * 0.42, 0, TAU); ctx.fill();
+    ctx.fillStyle = '#f7ddb5';
+    ctx.font = 'bold 13px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('家', NEST.x, NEST.y - NEST.r - 8);
+
+    // 种子
+    for (const s of seeds) {
+      const bob = Math.sin(t * 3 + s.bob) * 2;
+      ctx.save();
+      ctx.translate(s.x, s.y + bob);
+      ctx.rotate(0.4);
+      ctx.fillStyle = '#c98f3d';
+      ctx.beginPath(); ctx.ellipse(0, 0, 5, 8, 0, 0, TAU); ctx.fill();
+      ctx.fillStyle = '#8a5a22';
+      ctx.fillRect(-1.5, -8, 3, 16);
+      ctx.restore();
+    }
+
+    // 猫
+    for (const c of cats) drawCat(c);
+
+    // 玩家
+    drawHamster(player.x, player.y, player.r, player.face, player.anim);
+
+    // 粒子
+    for (const p of particles) {
+      ctx.globalAlpha = Math.min(1, p.life * 2);
+      ctx.fillStyle = p.color;
+      ctx.beginPath(); ctx.arc(p.x, p.y, 3, 0, TAU); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // ===== HUD =====
+    // 粮仓分数
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.beginPath(); ctx.roundRect(14, 12, 190, 66, 12); ctx.fill();
+    ctx.fillStyle = '#ffe9a8';
+    ctx.font = 'bold 24px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`🌻 ${score}`, 28, 42);
+    ctx.fillStyle = '#c8b598';
+    ctx.font = '13px sans-serif';
+    ctx.fillText(`第 ${day} / 3 天 · 最佳 ${best}`, 28, 64);
+
+    // 腮帮容量
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.beginPath(); ctx.roundRect(W - 214, 12, 200, 66, 12); ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 15px sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText(`腮帮  ${carried} / ${capacity}`, W - 198, 38);
+    // 负重条
+    const bw = 172, ratio = carried / capacity;
+    ctx.fillStyle = 'rgba(255,255,255,0.18)';
+    ctx.beginPath(); ctx.roundRect(W - 198, 50, bw, 10, 5); ctx.fill();
+    ctx.fillStyle = ratio > 0.8 ? '#ff8a7a' : '#ffcf5c';
+    ctx.beginPath(); ctx.roundRect(W - 198, 50, bw * ratio, 10, 5); ctx.fill();
+
+    // 天数进度
+    ctx.fillStyle = 'rgba(255,255,255,0.15)';
+    ctx.beginPath(); ctx.roundRect(W / 2 - 110, 16, 220, 8, 4); ctx.fill();
+    ctx.fillStyle = '#9ad08a';
+    const dayProg = 1 - dayTimer / DAY_LEN;
+    ctx.beginPath(); ctx.roundRect(W / 2 - 110, 16, 220 * dayProg, 8, 4); ctx.fill();
+
+    // 提示消息
+    if (msgTimer > 0) {
+      ctx.globalAlpha = Math.min(1, msgTimer * 2);
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 22px sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(msg, W / 2, 70);
+      ctx.globalAlpha = 1;
+    }
+
+    // 受伤红闪
+    if (stealFlash > 0) {
+      ctx.fillStyle = `rgba(255, 60, 40, ${stealFlash * 0.5})`;
+      ctx.fillRect(-20, -20, W + 40, H + 40);
+    }
+
+    ctx.restore();
+
+    // ===== 标题 / 结算界面 =====
+    if (state !== 'playing') {
+      ctx.fillStyle = 'rgba(12, 10, 8, 0.78)';
+      ctx.fillRect(0, 0, W, H);
+      ctx.textAlign = 'center';
+      if (state === 'title') {
+        drawHamster(W / 2, H / 2 - 90, 34, 1, t * 6);
+        ctx.fillStyle = '#ffe9a8';
+        ctx.font = 'bold 44px sans-serif';
+        ctx.fillText('囤粮大作战', W / 2, H / 2 + 10);
+        ctx.fillStyle = '#c8b598';
+        ctx.font = '17px sans-serif';
+        ctx.fillText('帮 Lucky 在三天里囤下最多的瓜子', W / 2, H / 2 + 48);
+        ctx.fillText('WASD / 方向键 / 按住拖动 移动 · 回窝存粮 · 当心猫', W / 2, H / 2 + 76);
+        ctx.fillStyle = '#ffcf5c';
+        ctx.font = 'bold 18px sans-serif';
+        ctx.fillText('点击 或 按空格 开始', W / 2, H / 2 + 128);
+      } else {
+        ctx.fillStyle = '#ffe9a8';
+        ctx.font = 'bold 40px sans-serif';
+        ctx.fillText('三天结束！', W / 2, H / 2 - 60);
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 30px sans-serif';
+        ctx.fillText(`🌻 共存入 ${score} 颗瓜子`, W / 2, H / 2);
+        ctx.fillStyle = score >= best ? '#ffcf5c' : '#c8b598';
+        ctx.font = '17px sans-serif';
+        ctx.fillText(score >= best ? '新纪录！Lucky 冬天不用愁了' : `历史最佳 ${best} 颗`, W / 2, H / 2 + 36);
+        ctx.fillStyle = '#ffcf5c';
+        ctx.font = 'bold 18px sans-serif';
+        ctx.fillText('点击 或 按空格 再来一局', W / 2, H / 2 + 96);
+      }
+    }
+  }
+
+  // ================= 主循环 =================
+  function loop(ts) {
+    const dt = Math.min(0.05, (ts - lastTs) / 1000 || 0);
+    lastTs = ts;
+    if (state === 'playing') update(dt);
+    else t += dt;
+    draw();
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
